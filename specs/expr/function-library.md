@@ -117,7 +117,9 @@ The following function families use this pattern:
   counting characters, clamps negative widths to zero (matching Python), then
   charges generated padding bytes and checks the exact output byte count.
   `zfill` borrows string and preserved-float input text until this preflight
-  succeeds, and calls the same crate-visible helper from `misc.rs`.
+  succeeds, and calls the same crate-visible helper from `misc.rs`. For `center`,
+  odd padding places the extra space on the left only when the requested width is
+  also odd, matching Python; otherwise the extra space is on the right.
 - **Representation functions** (`repr_py`, `repr_json`, `repr_sh`,
   `repr_cmd`, `repr_pwsh`) use `preflight_repr`. It first charges the recursive
   list item count from `count_list_items`, then obtains a byte bound from
@@ -455,6 +457,11 @@ path operations, etc.) are defined in the
 sections 2.1 (Operators) and 2.2 (Built-in Functions). Key implementation choices:
 
 - **Integer arithmetic** uses Python-style floored division and modulo (§2.1.1)
+- **Float modulo** starts from the truncating floating-point remainder and corrects
+  its sign to match the divisor. It does not reconstruct the remainder from a rounded
+  quotient, which would lose precision for large quotients.
+- **Float floor division** derives its quotient from that remainder before rounding
+  toward negative infinity. This avoids flooring an already-rounded direct quotient.
 - **`round()`** uses banker's rounding / round-half-even (§2.2.2)
 - **Regex functions** reject lookahead, lookbehind, backreferences, and `\Z` (§2.2.5).
   Validation uses `regex_syntax::Parser` to parse the pattern into its HIR and

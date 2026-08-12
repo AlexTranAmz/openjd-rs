@@ -1402,7 +1402,7 @@ fn relative_to_component_boundary_error() {
 // path::join — unit tests for the format-aware join function
 // ══════════════════════════════════════════════════════════════
 
-use openjd_expr::functions::path::join as path_join;
+use openjd_expr::functions::path::{join as path_join, non_uri_join};
 
 // --- POSIX format ---
 
@@ -1534,6 +1534,54 @@ fn join_uri_left_normalizes_backslashes_posix_format() {
     );
 }
 
+#[test]
+fn join_uri_left_absolute_right_replaces() {
+    assert_eq!(
+        path_join("s3://bucket/prefix", "/foo", PathFormat::Posix),
+        "/foo"
+    );
+    assert_eq!(
+        path_join("s3://bucket/prefix", "/foo", PathFormat::Uri),
+        "/foo"
+    );
+    assert_eq!(
+        eval_posix("P / '/foo'", &posix_st("P", "s3://bucket/prefix")).to_display_string(),
+        "/foo"
+    );
+}
+
+#[test]
+fn join_uri_left_root_relative_windows_preserves_authority() {
+    assert_eq!(
+        path_join("s3://bucket/prefix", "/foo", PathFormat::Windows),
+        "s3://bucket/foo"
+    );
+    assert_eq!(
+        path_join("s3://bucket/prefix", "\\foo", PathFormat::Windows),
+        "s3://bucket/foo"
+    );
+    assert_eq!(
+        eval_windows(r"P / r'\foo'", &windows_st("P", "s3://bucket/prefix")).to_display_string(),
+        "s3://bucket/foo"
+    );
+}
+
+#[test]
+fn join_uri_left_drive_relative_windows_replaces_uri() {
+    assert_eq!(
+        path_join("s3://bucket/prefix", "C:", PathFormat::Windows),
+        "C:"
+    );
+    assert_eq!(
+        path_join("s3://bucket/prefix", "C:foo", PathFormat::Windows),
+        "C:foo"
+    );
+    assert_eq!(
+        eval_windows("P / 'C:'", &windows_st("P", "s3://bucket/prefix")).to_display_string(),
+        "C:"
+    );
+}
+
 // --- Absolute right (URI) ---
 
 #[test]
@@ -1580,6 +1628,22 @@ fn join_windows_backslash_root_relative() {
     assert_eq!(
         path_join("C:\\base", "\\foo", PathFormat::Windows),
         "C:\\foo"
+    );
+}
+
+#[test]
+fn join_windows_root_relative_replaces_drive_less_left() {
+    assert_eq!(path_join("a\\b", "\\foo", PathFormat::Windows), "\\foo");
+    assert_eq!(path_join("a\\b", "/foo", PathFormat::Windows), "/foo");
+    assert_eq!(non_uri_join("a\\b", "\\foo", PathFormat::Windows), "\\foo");
+    assert_eq!(non_uri_join("a\\b", "/foo", PathFormat::Windows), "/foo");
+    assert_eq!(
+        non_uri_join("C:\\base", "\\foo", PathFormat::Windows),
+        "C:\\foo"
+    );
+    assert_eq!(
+        eval_windows(r"P / r'\x'", &windows_st("P", r"a\b")).to_display_string(),
+        r"\x"
     );
 }
 
