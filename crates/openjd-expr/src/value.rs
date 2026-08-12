@@ -727,6 +727,14 @@ impl ExprValue {
     /// Coercion is non-destructive: only conversions that don't lose
     /// information are attempted (`int → float`, `int → string`, etc).
     ///
+    /// Unresolved values apply the same table at the type level and return
+    /// an unresolved value constrained to the result type. Checks that need
+    /// a concrete payload, such as parsing a string as an integer, are
+    /// deferred until resolution. The type-level table may therefore accept
+    /// a pair that the concrete value later rejects, but it must never
+    /// reject one the concrete value would accept — that would fail a
+    /// template during validation that would have run correctly.
+    ///
     /// An `any` target is unconstrained: every value is returned
     /// unchanged.
     ///
@@ -748,6 +756,17 @@ impl ExprValue {
         // coercion is a no-op (RFC 0005 §"Type System").
         if target.code() == TypeCode::Any {
             return Ok(self);
+        }
+        // Unresolved values have no payload, so apply the concrete coercion
+        // table at the type level and defer payload-dependent checks until
+        // resolution. The result constraint must satisfy the target just as
+        // a concrete result's type would.
+        if let ExprValue::Unresolved(constraint) = &self {
+            return if let Some(result_type) = Self::unresolved_coercion_result(constraint, target) {
+                Ok(ExprValue::unresolved(result_type))
+            } else {
+                Err(format!("Cannot coerce {constraint} to {target}"))
+            };
         }
         // Match-first: also accepts the case where the target is a union
         // and the value's type is one of its members. Falls back to the
@@ -813,6 +832,22 @@ impl ExprValue {
             }
             (ExprValue::RangeExpr(r), TypeCode::String) => Ok(ExprValue::String(r.to_string())),
             (ExprValue::RangeExpr(r), TypeCode::List) => {
+                // RFC 0005: `list[int]` is the only list type a range_expr
+                // implicitly coerces to. Implicit rules do not chain, so the
+                // materialized `list[int]` is never widened element-wise
+                // toward another target; templates use the explicit `list()`
+                // conversion (RFC 0006) when they want that. An `any`
+                // element target is accepted because a `list[int]` value
+                // already satisfies `list[any]` — no widening involved.
+                if let Some(elem) = target.params().first() {
+                    if elem != &ExprType::INT && elem.code() != TypeCode::Any {
+                        return Err(format!(
+                            "Cannot coerce range_expr to {target}: a range \
+                             expression only implicitly coerces to list[int] \
+                             (use list() for an explicit conversion)"
+                        ));
+                    }
+                }
                 // coerce() runs outside any EvalContext (post-evaluation
                 // target-type hook, public API), so no operation or memory
                 // budget applies here. Cap the materialization at the
@@ -843,6 +878,117 @@ impl ExprValue {
                 }
             }
             _ => Err(format!("Cannot coerce {} to {target}", self.expr_type())),
+        }
+    }
+
+    fn unresolved_coercion_result(source: &ExprType, target: &ExprType) -> Option<ExprType> {
+        if target.code() == TypeCode::Any {
+            return Some(source.clone());
+        }
+        if source.code() == TypeCode::Unresolved {
+            return source
+                .params()
+                .first()
+                .and_then(|inner| Self::unresolved_coercion_result(inner, target));
+        }
+        if source.code() == TypeCode::Union {
+            let result_types: Vec<_> = source
+                .params()
+                .iter()
+                .filter_map(|member| Self::unresolved_coercion_result(member, target))
+                .collect();
+            return if result_types.is_empty() {
+                None
+            } else {
+                Some(ExprType::union(result_types))
+            };
+        }
+        if source.code() == TypeCode::Any
+            || matches!(
+                source.code(),
+                TypeCode::TypeVarT
+                    | TypeCode::TypeVarT1
+                    | TypeCode::TypeVarT2
+                    | TypeCode::TypeVarT3
+            )
+        {
+            return Some(target.clone());
+        }
+        if target.code() == TypeCode::Union {
+            if target.match_type(source).is_some() {
+                return Some(source.clone());
+            }
+            for member in target.params() {
+                if matches!(
+                    member.code(),
+                    TypeCode::NullType | TypeCode::List | TypeCode::Union
+                ) {
+                    continue;
+                }
+                if let Some(result_type) = Self::unresolved_coercion_result(source, member) {
+                    return Some(result_type);
+                }
+            }
+            return None;
+        }
+        // Note there is deliberately no rule for a type-variable *target*:
+        // the concrete table has no arm for one either, so a concrete value
+        // always fails against it. Accepting the unresolved case would let
+        // validation pass an expression that can only fail at runtime.
+        if source == target {
+            return Some(source.clone());
+        }
+        if source.code() == TypeCode::List
+            && source.params().len() == 1
+            && target.code() == TypeCode::List
+            && target.params().len() == 1
+        {
+            // Any list/list pair is accepted: an `unresolved[list[S]]`
+            // could resolve to the empty list, which the concrete path
+            // coerces to any `list[U]` (element-wise over zero elements).
+            // Rejecting here would fail a template during validation that
+            // could have run correctly. The element compatibility check is
+            // deferred until the value resolves with a non-empty payload.
+            return Some(target.clone());
+        }
+
+        let has_scalar_rule = matches!(
+            (source.code(), target.code()),
+            (TypeCode::Int, TypeCode::Float)
+                | (TypeCode::Float, TypeCode::Int)
+                | (
+                    TypeCode::Bool
+                        | TypeCode::Int
+                        | TypeCode::Float
+                        | TypeCode::Path
+                        | TypeCode::RangeExpr,
+                    TypeCode::String
+                )
+                | (
+                    TypeCode::String,
+                    TypeCode::NullType
+                        | TypeCode::Bool
+                        | TypeCode::Int
+                        | TypeCode::Float
+                        | TypeCode::Path
+                        | TypeCode::RangeExpr
+                )
+        );
+        // `list[int]` is the only list type a `range_expr` implicitly
+        // coerces to (RFC 0005); implicit rules do not chain, so no
+        // element-wise widening applies — mirroring the concrete path.
+        // An `any` element target is accepted because a `list[int]` value
+        // already satisfies `list[any]`.
+        let has_range_list_rule = source.code() == TypeCode::RangeExpr
+            && target.code() == TypeCode::List
+            && match target.params().first() {
+                Some(elem) => elem == &ExprType::INT || elem.code() == TypeCode::Any,
+                None => true,
+            };
+        if has_scalar_rule || has_range_list_rule {
+            Some(target.clone())
+        } else {
+            None
         }
     }
 

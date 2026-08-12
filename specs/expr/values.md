@@ -357,8 +357,24 @@ Applied when the evaluation result needs to match an expected type:
 - STRING → FLOAT (parse)
 - INT → FLOAT
 - RANGE_EXPR → STRING
-- RANGE_EXPR → LIST[INT]
+- RANGE_EXPR → LIST[INT] (the only list type; see below)
 - LIST[T] → LIST[U] (element-wise coercion)
+
+Coercion is type-directed: when it succeeds, the resulting value's type
+satisfies the requested target. Implicit rules do not chain: `list[int]`
+is the only list type a `range_expr` implicitly coerces to (RFC 0005), so
+a `list[T]` target with any other element type — `list[float]`,
+`list[string]`, `list[bool]` — is rejected rather than materialized and
+widened element-wise. (A `list[any]` target is accepted, since a
+`list[int]` value already satisfies it — no widening involved.) Templates
+that want the widened list chain the explicit `list()` conversion
+(RFC 0006), whose `list[int]` result the `LIST[T] → LIST[U]` rule then
+applies to.
+
+A **type variable** target (`T`, `T1`, `T2`, `T3`) has no coercion rule.
+Type variables are placeholders in generic function signatures, resolved
+by signature matching before any value is coerced, so reaching coercion
+with one still unbound is always an error.
 
 An **`any`** target is unconstrained (RFC 0005 lists it as "matches
 anything"): every value is returned unchanged, so an `any` target can
@@ -471,14 +487,50 @@ let result = evaluate_expression("Param.Frame + Param.Name", &symtab);
 // → TypeError: cannot add int and string
 ```
 
-When any argument to a function is unresolved, the function returns
-`Unresolved(return_type)` instead of computing a value. This propagates type information
-through the entire expression, catching type mismatches at validation time.
-
 Unresolved values are **type-only placeholders**: they carry an `ExprType` but no
 concrete data. Because they're wrapped values, they can pass through the evaluator's
 memory tracking and dispatch without a special code path. `Display` on an unresolved
-value renders as `unresolved[T]` for debug/error output. Calling the `.coerce()`
-target-type path on an unresolved value is a no-op (the unresolved wrapper is
-preserved through coercion), so validation-time format string resolution can still
-exercise the full coercion chain symbolically.
+value renders as `unresolved[T]` for debug/error output.
+
+All operations involving unresolved values use existential validation. For an
+`unresolved[T]` operand, `T` describes the set of concrete values and types to which
+that operand could resolve. With multiple unresolved operands, the possibilities are
+all combinations of their permitted resolutions.
+
+An operation succeeds symbolically if at least one possible combination would
+succeed. Possibilities that would fail are discarded. If no combination can succeed,
+the operation fails immediately. Otherwise, unless evaluation can prove a concrete
+result independent of the unresolved inputs, the result is unresolved and its
+constraint is the union of the result types from all successful possibilities.
+
+As expression processing progresses and unresolved operands become narrower or
+concrete, the same operation is evaluated with fewer possibilities. It may then
+produce a concrete result or report a value-dependent error that could not be proven
+at an earlier stage.
+
+Target-type coercion applies the same conversion table to unresolved types that
+it applies to concrete values. The payload remains unresolved, but its type is
+narrowed to the coercion result. For example, `unresolved[int]` against a
+`string` target becomes `unresolved[string]`, and
+`unresolved[int | string]` against an `int` target becomes `unresolved[int]`.
+Likewise, coercing `unresolved[int | list[int]]` to `int` succeeds as
+`unresolved[int]`: the `int` possibility succeeds even though the `list[int]`
+possibility cannot.
+
+Checks that require a concrete payload are deferred until runtime. For example,
+`unresolved[string]` can narrow to `unresolved[int]`; once resolved, the string
+must still parse as an integer. Any `unresolved[list[S]]` against any `list[U]`
+target is accepted for the same reason: the value could resolve to the empty
+list, which coerces to every list type, so element compatibility can only be
+checked once the payload is known. A source and target with no type-level
+coercion rule at all, such as `unresolved[list[int]]` against `int`, is
+rejected during validation.
+
+The two directions are deliberately asymmetric, and only in one direction.
+Unresolved coercion may accept a pair the concrete value later rejects, because
+the deciding information is a payload the placeholder does not carry. It must
+never reject a pair the concrete value would accept: doing so fails a template at
+validation time that would have run correctly, which no later stage can recover
+from. Any such case is a bug in the type-level table, not a deliberate
+narrowing — the `range_expr → list[int]` and type-variable-target rules above apply
+identically on both paths for this reason.
