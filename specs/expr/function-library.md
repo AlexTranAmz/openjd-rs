@@ -467,6 +467,55 @@ sections 2.1 (Operators) and 2.2 (Built-in Functions). Key implementation choice
 - **Float floor division** derives its quotient from that remainder before rounding
   toward negative infinity. This avoids flooring an already-rounded direct quotient.
 - **`round()`** uses banker's rounding / round-half-even (§2.2.2)
+- **String classification** (`isdigit`, `isalpha`, `isalnum`, `isspace`,
+  `isupper`, `islower`, §2.2.4) matches Python's `str` methods of the same
+  name exactly, not Rust's `char` predicates, which use different Unicode
+  properties (e.g. `char::is_alphabetic()` is the `Alphabetic` property, a
+  superset of Python's `L*` categories; `char::is_ascii_digit()` misses
+  non-ASCII decimal digits). Lookup tables in
+  `functions/unicode_tables.rs` are generated from CPython by
+  `scripts/generate_unicode_tables.py` and pinned to a stated Unicode
+  version (see `UNICODE_VERSION` in the generated file). `isupper`/`islower`
+  follow Python's cased-character rule: at least one cased character and
+  every cased character upper/lowercase — uncased characters (digits, CJK)
+  are ignored, and titlecase (Lt) characters are cased but neither upper
+  nor lower. Regenerate the tables with the script when intentionally
+  adopting a newer Unicode version.
+- **Whitespace trimming and splitting** (§2.2.4): `strip()`/`lstrip()`/
+  `rstrip()` without a `chars` argument and no-separator `split()`/
+  `rsplit()` trim and split on CPython's `Py_UNICODE_ISSPACE` set via the
+  same `SPACE` table as `isspace()` — Unicode `White_Space` plus the
+  information separators U+001C..U+001F, which Rust's
+  `str::trim`/`split_whitespace` (exactly `White_Space`) would miss.
+  The `int(string)`/`float(string)` conversions deliberately keep Rust's
+  `str::trim` instead: CPython's `int()`/`float()` accept `White_Space`
+  around the number but reject U+001C..U+001F (`int('\x1c5')` raises even
+  though `isspace('\x1c')` is `true`), so `White_Space` is the
+  CPython-exact set there.
+- **`int(string)` and `float(string)`** (§2.2.1) accept Unicode decimal
+  digits, matching CPython: characters with `Numeric_Type=Decimal` (general
+  category Nd, e.g. `'٣'` U+0663) are replaced with their ASCII values
+  before parsing, via `decimal_digit_value()` backed by the generated
+  `DECIMAL` table. This keeps the guard pattern
+  `int(Param.X) if isdigit(Param.X) else 0` sound for Nd digits.
+  `Numeric_Type=Digit` characters like `'²'` remain errors — `isdigit('²')`
+  is `true` but `int('²')` fails, exactly as in CPython. Two deliberate
+  differences from CPython remain: underscores between digits are rejected
+  (`int('1_0')` is an error here, `10` in CPython) because expression
+  strings come from template data where `'1_0'` is more likely a mistake
+  than a readability separator, and the implicit string→int/float coercion
+  of format-string results and parameter values (`ExprValue::from_str_coerce`)
+  stays ASCII-only.
+- **`title()` and `capitalize()`** (§2.2.4) also match Python exactly.
+  `title()` follows CPython's `do_title`: a character is titlecased when the
+  previous character is not cased, lowercased otherwise — so digits and
+  other uncased characters restart words (`'1st'` → `'1St'`). Word-start
+  characters use the full titlecase mapping (`TITLE_MAP`, ToTitleFull):
+  the dz-digraph U+01C6 titlecases to U+01C5 (not uppercase U+01C4), and
+  `ß` expands to `Ss`. `capitalize()` titlecases the first character (Python
+  ≥ 3.8 semantics) and lowercases the rest. Both apply the Final_Sigma
+  context rule when lowering U+03A3 (via the `CASED` and `CASE_IGNORABLE`
+  tables), which Rust's context-free `char::to_lowercase` cannot express.
 - **Regex functions** reject lookahead, lookbehind, backreferences, and `\Z` (§2.2.5).
   Validation parses the pattern with `regex_syntax`, rather than a substring
   scan. This correctly ignores lookaround-shaped syntax that appears inside
@@ -479,8 +528,13 @@ sections 2.1 (Operators) and 2.2 (Built-in Functions). Key implementation choice
   are erased by AST→HIR translation and must be rejected at the AST level:
   Unicode property classes (`\p{...}`/`\P{...}`), the `(?<name>...)` capture
   group spelling (Python requires `(?P<name>...)`), capture group names
-  that are not valid Python identifiers (`regex_syntax` also permits `.`,
-  `[`, `]`; Python raises "bad character in group name"), POSIX character
+  that are not valid Python identifiers — checked against the
+  `IDENT_START`/`IDENT_CONTINUE` tables generated from CPython's
+  `str.isidentifier()` (XID_Start/XID_Continue plus `_`), matching the
+  exact rule `sre_parse` applies; `regex_syntax` is more permissive,
+  allowing `.`, `[`, `]` and any `char::is_alphanumeric` character (e.g.
+  `²`, category No, which is not XID_Continue), where Python raises "bad
+  character in group name" — POSIX character
   classes (`[[:alpha:]]`), character class set operators (`--`, `&&`,
   `~~`), nested character classes (`[a[b]]`), Rust-only inline flags (`U`
   swap greed, `R` CRLF mode, negated `u`, and bare global negation
