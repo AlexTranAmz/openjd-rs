@@ -4,10 +4,13 @@
 
 //! Task parameter space and range resolution.
 
+use std::borrow::Cow;
+
 use indexmap::IndexMap;
 
 use openjd_expr::path_mapping::PathFormat;
 use openjd_expr::symbol_table::SymbolTable;
+use openjd_expr::value::Float64;
 use openjd_expr::ExprValue;
 use openjd_expr::RangeExpr;
 
@@ -266,17 +269,52 @@ fn resolve_int_range(
     }
 }
 
+/// A `Float64` with no preserved spelling — a `<float>` literal, or a value whose
+/// text could not be carried. Renders through `format_float`.
+fn float64(value: f64, param_name: &str) -> Result<Float64, ModelError> {
+    Float64::new(value).map_err(|_| {
+        ModelError::Expression(ExpressionError::new(format!(
+            "FLOAT parameter '{param_name}' range value {value} is not finite"
+        )))
+    })
+}
+
+/// Template Schemas §7.5 rule 1, keeping the sign and one digit: `'02.50'` ->
+/// `2.50`, `'007'` -> `7`, `'000'` -> `0`, `'0.50'` unchanged. Textual, so it
+/// cannot lose precision or change notation: `'01E+2'` -> `1E+2`.
+pub(crate) fn strip_redundant_leading_zeros(text: &str) -> Cow<'_, str> {
+    let sign_len = usize::from(text.starts_with(['+', '-']));
+    let digits = &text[sign_len..];
+    let zeros = digits.bytes().take_while(|b| *b == b'0').count();
+    // Redundant only when another digit follows. Otherwise the last zero is the
+    // integer part, as in '0.50' or '000'.
+    let strip = if digits.as_bytes().get(zeros).is_some_and(u8::is_ascii_digit) {
+        zeros
+    } else {
+        zeros.saturating_sub(1)
+    };
+    if strip == 0 {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() - strip);
+    out.push_str(&text[..sign_len]);
+    out.push_str(&digits[strip..]);
+    Cow::Owned(out)
+}
+
 fn resolve_float_range(
     range: &template::FloatRange,
     symtab: &SymbolTable,
     param_name: &str,
     limits: &EffectiveLimits,
-) -> Result<Vec<f64>, ModelError> {
-    let floats: Vec<f64> = match range {
+) -> Result<Vec<Float64>, ModelError> {
+    let floats: Vec<Float64> = match range {
         template::FloatRange::List(items) => items
             .iter()
             .map(|v| match v {
-                template::FloatRangeItem::Float(f) => Ok(*f),
+                // `2.50` and `2.5` are the same literal after parsing, so a
+                // `<float>` makes no request about how it renders.
+                template::FloatRangeItem::Float(f) => float64(*f, param_name),
                 template::FloatRangeItem::FormatString(fs) => {
                     let resolved = fs
                         .resolve_string_with(
@@ -285,7 +323,8 @@ fn resolve_float_range(
                                 .with_path_format(PathFormat::Posix),
                         )
                         .map_err(ModelError::Expression)?;
-                    let value = resolved.trim().parse::<f64>().map_err(|_| {
+                    let trimmed = resolved.trim();
+                    let value = trimmed.parse::<f64>().map_err(|_| {
                         ModelError::Expression(ExpressionError::new(format!(
                             "Cannot parse '{}' as float",
                             resolved
@@ -296,7 +335,22 @@ fn resolve_float_range(
                             "FLOAT parameter '{param_name}' range value '{resolved}' is not finite"
                         ))));
                     }
-                    Ok(value)
+                    // §7.5 rule 2: the f64 cannot carry the decimal places, so
+                    // the text rides alongside it.
+                    let text = strip_redundant_leading_zeros(trimmed);
+                    // Same per-element cap resolve_string_range applies, for the
+                    // same reason: a <FormatString> resolves to arbitrary length,
+                    // and this text is what lands on a command line.
+                    //
+                    // Over the cap this downgrades to value-only where the STRING
+                    // and PATH paths error. Deliberate: before this change a long
+                    // <floatstring> was parsed to an f64 and its text discarded,
+                    // so erroring would reject templates that were valid, whereas
+                    // a STRING element over the cap was always an error.
+                    if text.len() > limits.max_task_param_string_len {
+                        return float64(value, param_name);
+                    }
+                    Float64::with_str(value, text.into_owned()).map_err(ModelError::Expression)
                 }
             })
             .collect::<Result<Vec<_>, _>>()?,
@@ -312,8 +366,10 @@ fn resolve_float_range(
                     elements
                         .iter()
                         .map(|e| match e {
-                            ExprValue::Float(f) => Ok(f.value()),
-                            ExprValue::Int(i) => Ok(*i as f64),
+                            // No text: an expression element came from a literal
+                            // or an int, so `{{ [2.50] }}` is 2.5 (§7.5).
+                            ExprValue::Float(f) => float64(f.value(), param_name),
+                            ExprValue::Int(i) => float64(*i as f64, param_name),
                             other => Err(ModelError::Expression(ExpressionError::new(format!(
                                 "Expected float in range, got {}",
                                 other.type_name()
@@ -413,4 +469,51 @@ fn resolve_string_range(
         }
     }
     Ok(resolved)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use super::strip_redundant_leading_zeros as strip;
+
+    /// §7.5 rule 1. openjd-model-for-python asserts the same cases against its
+    /// regex form, `^([+-]?)0+(?=[0-9])`.
+    #[test]
+    fn strips_only_the_redundant_leading_zeros() {
+        // Redundant: another digit follows.
+        assert_eq!(strip("02.50"), "2.50");
+        assert_eq!(strip("007"), "7");
+        assert_eq!(strip("0007"), "7");
+        assert_eq!(strip("01E+2"), "1E+2");
+        assert_eq!(strip("-02.50"), "-2.50");
+        assert_eq!(strip("+02.50"), "+2.50");
+
+        // Not redundant: the zero is the integer part, so one digit stays.
+        assert_eq!(strip("0.50"), "0.50");
+        assert_eq!(strip("00.50"), "0.50");
+        assert_eq!(strip("0"), "0");
+        assert_eq!(strip("000"), "0");
+        assert_eq!(strip("-0.0"), "-0.0");
+        assert_eq!(strip("0e5"), "0e5");
+        assert_eq!(strip("00e5"), "0e5");
+
+        // Nothing to do.
+        assert_eq!(strip("1.5"), "1.5");
+        assert_eq!(strip("100"), "100");
+        assert_eq!(strip("3.500"), "3.500");
+
+        // §7.5 rule 2 is not this function's job: it never touches the fraction.
+        assert_eq!(strip("2.50"), "2.50");
+        assert_eq!(strip("0.0000001"), "0.0000001");
+    }
+
+    /// Not just an optimization: evidence that an unchanged element is returned
+    /// untouched rather than rebuilt.
+    #[test]
+    fn borrows_when_there_is_nothing_to_strip() {
+        assert!(matches!(strip("2.50"), Cow::Borrowed(_)));
+        assert!(matches!(strip("0.50"), Cow::Borrowed(_)));
+        assert!(matches!(strip("02.50"), Cow::Owned(_)));
+    }
 }

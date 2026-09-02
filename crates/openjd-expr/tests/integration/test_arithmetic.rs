@@ -635,6 +635,41 @@ fn negative_zero_normalized() {
     assert_eq!(eval("-0.0").to_display_string(), "0.0");
 }
 
+/// `round(v, n)` builds its display text with `{:.n$}`, so it renders to the
+/// requested number of places: `round(1.5, 2)` is `1.50`. Zero is not an
+/// exception to that, and the sign it does not have must not cost it the places.
+#[test]
+fn round_to_places_keeps_them_at_zero() {
+    assert_eq!(eval("round(1.5, 2)").to_display_string(), "1.50");
+    assert_eq!(eval("round(0.0004, 2)").to_display_string(), "0.00");
+    assert_eq!(eval("round(-0.0004, 2)").to_display_string(), "0.00");
+    assert_eq!(eval("round(0.0, 3)").to_display_string(), "0.000");
+}
+
+/// A signed zero loses its sign but keeps everything else, and text that reaches
+/// zero only by underflow is not the value's rendering at all.
+#[test]
+fn with_str_zero_text_matches_the_value() {
+    use openjd_expr::value::Float64;
+    let disp = |v: f64, s: &str| {
+        ExprValue::Float(Float64::with_str(v, s.to_string()).unwrap()).to_display_string()
+    };
+    assert_eq!(disp(0.0, "0.00"), "0.00");
+    assert_eq!(disp(-0.0, "-0.0"), "0.0");
+    assert_eq!(disp(-0.0, "-0.00"), "0.00");
+    // An all-zero mantissa spells zero whatever the exponent, so the notation
+    // survives here just as `1E+2` does for a non-zero value.
+    assert_eq!(disp(0.0, "0e5"), "0e5");
+    assert_eq!(disp(-0.0, "-0.0E+2"), "0.0E+2");
+    // Underflow is not zero being spelled: the digits are the author's request,
+    // and dropping them would render a different number.
+    assert_eq!(disp(0.0, "1e-400"), "1e-400");
+    assert_eq!(
+        disp(0.0, "0.0000000000000000000000000000000001"),
+        "0.0000000000000000000000000000000001"
+    );
+}
+
 #[test]
 fn negative_zero_from_arithmetic() {
     assert_eq!(eval("-1.0 * 0.0").to_display_string(), "0.0");

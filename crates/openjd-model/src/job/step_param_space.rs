@@ -18,7 +18,6 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use openjd_expr::value::Float64;
 use openjd_expr::{ExprValue, RangeExpr};
 
 use crate::error::ModelError;
@@ -1784,16 +1783,9 @@ fn make_leaf_node(
         job::TaskParameter::Float { range } => Ok(Box::new(RangeListNode {
             name: name.to_string(),
             param_type: TaskParameterType::Float,
-            values: range
-                .iter()
-                .map(|&f| {
-                    Float64::new(f).map(ExprValue::Float).map_err(|_| {
-                        ModelError::DecodeValidation(format!(
-                            "Parameter '{name}': float value {f} is not finite"
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?,
+            // Cloned rather than rebuilt from the f64: the element already carries
+            // the spelling §7.5 asks for, and `Float64::new` would drop it.
+            values: range.iter().cloned().map(ExprValue::Float).collect(),
         })),
         job::TaskParameter::String { range } => Ok(Box::new(RangeListNode {
             name: name.to_string(),

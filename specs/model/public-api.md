@@ -592,7 +592,7 @@ pub struct job::StepParameterSpace {
 
 pub enum job::TaskParameter {
     Int { range: TaskParamRange<i64>, chunks: Option<ResolvedChunks> },
-    Float { range: Vec<f64> },
+    Float { range: Vec<Float64> },
     String { range: Vec<String> },
     Path { range: Vec<String> },
     ChunkInt { range: TaskParamRange<i64>, chunks: ResolvedChunks },
