@@ -23,6 +23,13 @@ use crate::error::{path_field, path_index, PathElement, ValidationErrors};
 use crate::template::*;
 use crate::types::{ModelExtension, ValidationContext};
 
+/// Maximum length of a `let` binding's `<UserIdentifier>` (§3.6.1).
+///
+/// Flat, so not `EffectiveLimits::max_identifier_len`: that is the §7.1 cap, 64
+/// without `FEATURE_BUNDLE_1`, and a 512-character name must be accepted with
+/// EXPR alone.
+const MAX_LET_IDENTIFIER_LEN: usize = 512;
+
 /// Build a symbol table containing Param/RawParam entries from job parameter definitions.
 /// RawParam.* is always STRING for PATH types and LIST_STRING for LIST_PATH types,
 /// matching Python behavior where RawParam holds the raw unprocessed value.
@@ -1383,6 +1390,15 @@ fn validate_let_bindings(
             errors.add(
                 &b_path,
                 format!("name '{name}' contains invalid characters."),
+            );
+        }
+        // Characters, not bytes: §3.6.1 caps characters, and the charset check
+        // above does not `continue`, so a multi-byte name would otherwise draw a
+        // spurious length error alongside the real one.
+        if name.chars().count() > MAX_LET_IDENTIFIER_LEN {
+            errors.add(
+                &b_path,
+                format!("name '{name}' exceeds {MAX_LET_IDENTIFIER_LEN} characters."),
             );
         }
         if !names.insert(name.to_string()) {
